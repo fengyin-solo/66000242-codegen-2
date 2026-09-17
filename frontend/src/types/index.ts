@@ -53,6 +53,19 @@ export interface HistoryDataPoint {
   quality: 'Good' | 'Bad' | 'Uncertain'
 }
 
+// 指标回看采样点（数值测点）
+export interface ReviewSample {
+  timestamp: number
+  value: number
+  quality: 'Good' | 'Bad' | 'Uncertain'
+}
+
+// 无数据区间（如数据源断开期间），end 为 Infinity 表示断开仍在持续
+export interface NoDataInterval {
+  start: number
+  end: number
+}
+
 // 节点详情
 export interface NodeDetail {
   node: OPCUANode

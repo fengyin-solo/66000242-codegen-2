@@ -126,11 +126,26 @@
         </div>
       </div>
     </div>
+
+    <!-- 指标回看分析入口 -->
+    <div class="review-section">
+      <div class="review-entry">
+        <h3 class="section-title">指标回看分析</h3>
+        <el-button type="primary" plain size="small" @click="reviewVisible = true">
+          打开回看分析
+        </el-button>
+      </div>
+      <p class="review-hint">
+        挑选若干测点并自定义时间段，概览视图把多条读数曲线放在同一张图中对比，
+        并给出每个测点的最大、最小与平均读数；断开期间标注为无数据，不以零值填充。
+      </p>
+      <ReviewAnalysis v-model:visible="reviewVisible" />
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -138,10 +153,14 @@ import { LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, TitleComponent } from 'echarts/components'
 import { CircleCheckFilled, CircleCloseFilled } from '@element-plus/icons-vue'
 import { useOpcuaStore } from '../store/opcua'
+import ReviewAnalysis from './ReviewAnalysis.vue'
 
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, TitleComponent])
 
 const store = useOpcuaStore()
+
+// 指标回看分析弹窗
+const reviewVisible = ref(false)
 
 // 获取节点当前值
 function getNodeValue(nodeId: string): number | boolean {
@@ -364,5 +383,26 @@ const flowChartOption = computed(() => buildChartOption('流量趋势', 'flow_me
 @media (max-width: 1200px) {
   .gauges-grid { grid-template-columns: repeat(2, 1fr); }
   .charts-grid { grid-template-columns: 1fr; }
+}
+
+.review-section {
+  margin-top: 20px;
+}
+
+.review-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.review-entry .section-title {
+  margin-bottom: 0;
+}
+
+.review-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.6;
 }
 </style>

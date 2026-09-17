@@ -1,6 +1,26 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { OPCUANode, DataValue, AlarmEvent, SubscriptionConfig } from '../types'
+import type { OPCUANode, DataValue, AlarmEvent, SubscriptionConfig, ReviewSample, NoDataInterval } from '../types'
+
+// 回看分析最多保留的采样点数（约 60 分钟秒级采样）
+const REVIEW_MAX_SAMPLES = 3600
+// 回看选择持久化键
+const REVIEW_PREFS_KEY = 'opcua-review-prefs'
+
+interface ReviewPrefs {
+  nodeIds: string[]
+  rangeStart: number
+  rangeEnd: number
+}
+
+function loadReviewPrefs(): ReviewPrefs | null {
+  try {
+    const raw = localStorage.getItem(REVIEW_PREFS_KEY)
+    return raw ? JSON.parse(raw) as ReviewPrefs : null
+  } catch {
+    return null
+  }
+}
 
 export const useOpcuaStore = defineStore('opcua', () => {
   // 状态
@@ -11,6 +31,40 @@ export const useOpcuaStore = defineStore('opcua', () => {
   const realTimeData = ref<Map<string, DataValue>>(new Map())
   const isConnected = ref(false)
   const dataHistory = ref<Map<string, Array<{ timestamp: number; value: number }>>>(new Map())
+
+  // ---- 指标回看分析 ----
+  // 与 dataHistory 相互独立：现有固定曲线继续只读 dataHistory，不受回看影响
+  const reviewHistory = ref<Map<string, ReviewSample[]>>(new Map())
+  // 数据源断开区间（历史的 + 当前持续中的）
+  const noDataIntervals = ref<NoDataInterval[]>([])
+  const disconnectSince = ref<number | null>(null)
+  // 用户选择的测点与时间区间，关闭后重开仍保留
+  const reviewNodeIds = ref<string[]>([])
+  const reviewRange = ref<[number, number]>([Date.now() - 5 * 60 * 1000, Date.now()])
+  let reviewPrefsLoaded = false
+
+  function restoreReviewPrefs() {
+    if (reviewPrefsLoaded) return
+    reviewPrefsLoaded = true
+    const prefs = loadReviewPrefs()
+    if (prefs) {
+      reviewNodeIds.value = prefs.nodeIds
+      reviewRange.value = [prefs.rangeStart, prefs.rangeEnd]
+    }
+  }
+
+  function persistReviewPrefs() {
+    const prefs: ReviewPrefs = {
+      nodeIds: reviewNodeIds.value,
+      rangeStart: reviewRange.value[0],
+      rangeEnd: reviewRange.value[1]
+    }
+    try {
+      localStorage.setItem(REVIEW_PREFS_KEY, JSON.stringify(prefs))
+    } catch {
+      // localStorage 不可用时静默降级为仅内存保留
+    }
+  }
 
   // 初始化模拟节点树
   function initNodeTree() {
@@ -121,6 +175,9 @@ export const useOpcuaStore = defineStore('opcua', () => {
 
   // 模拟实时数据更新
   function simulateDataUpdate() {
+    if (!isConnected.value) return
+    // 首次采样前回填历史（此时 Date.now() 与首个实时点只相差 1s，不会产生伪缺口）
+    backfillReviewHistory()
     const nodes = getAllVariableNodes()
     nodes.forEach(node => {
       const currentValue = realTimeData.value.get(node.id)?.value ?? node.value
@@ -158,6 +215,14 @@ export const useOpcuaStore = defineStore('opcua', () => {
       history.push({ timestamp: Date.now(), value: typeof newValue === 'number' ? newValue : 0 })
       if (history.length > 100) history.shift()
       dataHistory.value.set(node.id, history)
+
+      // 记录回看采样：仅数值测点且质量码非 Bad（Bad 表示读取失败，不是有效读数，不能当零值）
+      if (typeof newValue === 'number' && dataValue.quality !== 'Bad') {
+        const reviewSamples = reviewHistory.value.get(node.id) || []
+        reviewSamples.push({ timestamp: Date.now(), value: newValue, quality: dataValue.quality })
+        if (reviewSamples.length > REVIEW_MAX_SAMPLES) reviewSamples.shift()
+        reviewHistory.value.set(node.id, reviewSamples)
+      }
 
       // 检查报警条件
       checkAlarms(node, newValue)
@@ -265,13 +330,76 @@ export const useOpcuaStore = defineStore('opcua', () => {
 
   // 连接模拟
   function connect() {
+    // 从断开中恢复：闭合当前的无数据区间
+    if (disconnectSince.value !== null) {
+      noDataIntervals.value.push({ start: disconnectSince.value, end: Date.now() })
+      disconnectSince.value = null
+    }
     isConnected.value = true
     initNodeTree()
   }
 
+  // 首次收到实时采样前回填一段历史采样，使回看模块在刚进入页面时也有数据可看
+  // 仅回填回看缓冲，实时曲线使用的 dataHistory 不受影响
+  function backfillReviewHistory() {
+    if (reviewHistory.value.size > 0) return
+    const now = Date.now()
+    const spanMs = 30 * 60 * 1000
+    const stepMs = 5000
+    const numericNodes = getAllVariableNodes().filter(
+      n => (n.dataType === 'Double' || n.dataType === 'Int32') && typeof n.value === 'number'
+    )
+    numericNodes.forEach(node => {
+      const base = node.value as number
+      const samples: ReviewSample[] = []
+      for (let t = now - spanMs; t <= now; t += stepMs) {
+        const noise = (Math.random() - 0.5) * (node.dataType === 'Int32' ? 24 : base * 0.04)
+        const v = node.dataType === 'Int32'
+          ? Math.round(base + noise)
+          : Math.round((base + noise) * 100) / 100
+        samples.push({
+          timestamp: t,
+          value: v,
+          quality: Math.random() > 0.97 ? 'Uncertain' : 'Good'
+        })
+      }
+      reviewHistory.value.set(node.id, samples)
+    })
+  }
+
   // 断开连接
   function disconnect() {
+    if (isConnected.value) {
+      disconnectSince.value = Date.now()
+    }
     isConnected.value = false
+  }
+
+  // ---- 回看分析数据查询 ----
+  // 返回当前仍在持续的断开区间（未闭合）
+  const activeDisconnect = computed<NoDataInterval | null>(() =>
+    disconnectSince.value !== null ? { start: disconnectSince.value, end: Infinity } : null
+  )
+
+  // 与 [start, end] 有交集的无数据区间（含进行中的断开）
+  function getNoDataIntervals(start: number, end: number): NoDataInterval[] {
+    const intervals = noDataIntervals.value.filter(i => i.end >= start && i.start <= end)
+    const active = activeDisconnect.value
+    if (active && active.end >= start && active.start <= end) intervals.push(active)
+    return intervals
+  }
+
+  // 取测点在 [start, end] 内的采样（复制数组，避免视图侧误改缓冲）
+  function getReviewSamples(nodeId: string, start: number, end: number): ReviewSample[] {
+    const samples = reviewHistory.value.get(nodeId) || []
+    return samples.filter(s => s.timestamp >= start && s.timestamp <= end)
+  }
+
+  // 保存回看选择：切换测点、关闭重开均不丢失
+  function setReviewSelection(nodeIds: string[], range: [number, number]) {
+    reviewNodeIds.value = [...nodeIds]
+    reviewRange.value = [range[0], range[1]]
+    persistReviewPrefs()
   }
 
   // 计算属性
@@ -287,6 +415,12 @@ export const useOpcuaStore = defineStore('opcua', () => {
     realTimeData,
     isConnected,
     dataHistory,
+    // 回看分析
+    reviewHistory,
+    noDataIntervals,
+    reviewNodeIds,
+    reviewRange,
+    activeDisconnect,
     // 方法
     initNodeTree,
     simulateDataUpdate,
@@ -298,6 +432,10 @@ export const useOpcuaStore = defineStore('opcua', () => {
     connect,
     disconnect,
     getAllVariableNodes,
+    restoreReviewPrefs,
+    getReviewSamples,
+    getNoDataIntervals,
+    setReviewSelection,
     // 计算属性
     activeAlarmsCount,
     criticalAlarmsCount
