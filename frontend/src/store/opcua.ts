@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { OPCUANode, DataValue, AlarmEvent, SubscriptionConfig } from '../types'
+import type { OPCUANode, DataValue, AlarmEvent, SubscriptionConfig, SamplePoint, DisconnectRange } from '../types'
+
+// 回看分析保留的采样时长：最近 1 小时（采样间隔 1s）
+const HISTORY_LIMIT = 3600
+const HISTORY_RETENTION_MS = HISTORY_LIMIT * 1000
 
 export const useOpcuaStore = defineStore('opcua', () => {
   // 状态
@@ -10,7 +14,15 @@ export const useOpcuaStore = defineStore('opcua', () => {
   const alarms = ref<AlarmEvent[]>([])
   const realTimeData = ref<Map<string, DataValue>>(new Map())
   const isConnected = ref(false)
-  const dataHistory = ref<Map<string, Array<{ timestamp: number; value: number }>>>(new Map())
+  // 每个测点一份采样，value 可能为 null（该时刻无数据），回看分析与固定曲线都读它
+  const dataHistory = ref<Map<string, SamplePoint[]>>(new Map())
+  // 数据源断开区间，回看时用于在图上标注“无数据”
+  const disconnectRanges = ref<DisconnectRange[]>([])
+  // 节点树向回看模块发起“加入对比”的请求信号（不直接持有回看选择，避免与模块持久化耦合）
+  const playbackPickRequest = ref<{ nonce: number; nodeId: string } | null>(null)
+
+  // 每个测点的“坏数据窗口”剩余采样数（模拟数据源短期中断，不随响应式暴露）
+  const badWindowRemaining = new Map<string, number>()
 
   // 初始化模拟节点树
   function initNodeTree() {
@@ -121,10 +133,23 @@ export const useOpcuaStore = defineStore('opcua', () => {
 
   // 模拟实时数据更新
   function simulateDataUpdate() {
+    const now = Date.now()
     const nodes = getAllVariableNodes()
     nodes.forEach(node => {
       const currentValue = realTimeData.value.get(node.id)?.value ?? node.value
-      
+      const numeric = typeof currentValue === 'number' || node.dataType !== 'Boolean'
+
+      // 数据源中断窗口内不产生有效采样
+      let remaining = badWindowRemaining.get(node.id) ?? 0
+      if (remaining <= 0 && numeric && Math.random() < 0.008) {
+        // 随机开启一次 3~8 秒的短期中断
+        remaining = 3 + Math.floor(Math.random() * 6)
+      }
+      const inBadWindow = remaining > 0
+      if (remaining > 0) {
+        badWindowRemaining.set(node.id, remaining - 1)
+      }
+
       let newValue: number | boolean | string
       if (node.dataType === 'Double') {
         const numVal = typeof currentValue === 'number' ? currentValue : parseFloat(String(currentValue))
@@ -140,28 +165,56 @@ export const useOpcuaStore = defineStore('opcua', () => {
         newValue = currentValue
       }
 
+      const quality: DataValue['quality'] = inBadWindow ? 'Bad' : Math.random() > 0.98 ? 'Uncertain' : 'Good'
+
       const dataValue: DataValue = {
         nodeId: node.nodeId,
-        value: newValue,
-        quality: Math.random() > 0.98 ? 'Uncertain' : 'Good',
-        timestamp: Date.now(),
-        sourceTimestamp: Date.now(),
-        serverTimestamp: Date.now()
+        // 中断期间无有效读数，保留最近一次数值仅用于实时卡片，质量码明确为 Bad
+        value: inBadWindow ? currentValue : newValue,
+        quality,
+        timestamp: now,
+        sourceTimestamp: now,
+        serverTimestamp: now
       }
 
       realTimeData.value.set(node.id, dataValue)
-      node.value = newValue
-      node.quality = dataValue.quality
+      node.quality = quality
+      if (!inBadWindow) {
+        node.value = newValue
+      }
 
-      // 记录历史数据
-      const history = dataHistory.value.get(node.id) || []
-      history.push({ timestamp: Date.now(), value: typeof newValue === 'number' ? newValue : 0 })
-      if (history.length > 100) history.shift()
-      dataHistory.value.set(node.id, history)
+      // 记录采样：中断/坏质量时刻写入 null（无数据），不能记成 0；仅数值测点参与曲线
+      if (node.dataType !== 'Boolean') {
+        const history = dataHistory.value.get(node.id) || []
+        history.push({
+          timestamp: now,
+          value: inBadWindow ? null : (newValue as number),
+          quality
+        })
+        // 按时间与条数双重裁剪，保留最近一小时采样
+        while (history.length > HISTORY_LIMIT ||
+          (history.length > 0 && now - history[0].timestamp > HISTORY_RETENTION_MS)) {
+          history.shift()
+        }
+        dataHistory.value.set(node.id, history)
+      }
 
-      // 检查报警条件
-      checkAlarms(node, newValue)
+      // 检查报警条件（无数据时不参与越限判断）
+      if (!inBadWindow) {
+        checkAlarms(node, newValue)
+      }
     })
+  }
+
+  // 回看分析：取指定测点在 [start, end] 内的采样（裁剪自同一份 dataHistory）
+  function getSamples(nodeId: string, start: number, end: number): SamplePoint[] {
+    const history = dataHistory.value.get(nodeId) || []
+    return history.filter(p => p.timestamp >= start && p.timestamp <= end)
+  }
+
+  // 从节点树把测点加入回看对比
+  function requestPlaybackPick(nodeId: string) {
+    playbackPickRequest.value = { nonce: Date.now() + Math.random(), nodeId }
   }
 
   // 检查报警
@@ -227,6 +280,59 @@ export const useOpcuaStore = defineStore('opcua', () => {
     return variables
   }
 
+  // 回看分析可选测点：仅数值型测点参与曲线对比
+  function getNumericNodes(): OPCUANode[] {
+    return getAllVariableNodes().filter(n => n.dataType !== 'Boolean')
+  }
+
+  // 预置最近 5 分钟采样，使首次进入/重开时回看区间内就有数据可看；
+  // 其中包含一段所有测点同时无数据的“数据源断开”区间与各测点自身的坏点
+  function seedHistory() {
+    if (dataHistory.value.size > 0) return
+    const now = Date.now()
+    const nodes = getNumericNodes()
+
+    // 确定性的伪随机，保证同一时刻同一测点取到相同种子值
+    function seeded(nodeIndex: number, t: number, salt: number) {
+      const x = Math.sin(nodeIndex * 127.1 + t * 0.031 + salt * 13.7) * 43758.5453
+      return x - Math.floor(x)
+    }
+    function baseValue(node: OPCUANode): number {
+      return typeof node.value === 'number' ? node.value : 0
+    }
+    function seedValue(node: OPCUANode, nodeIndex: number, t: number): number {
+      const base = baseValue(node)
+      const span = Math.max(Math.abs(base) * 0.08, 1)
+      const wave = Math.sin(t / 30 + nodeIndex) * span * 0.8
+      const noise = (seeded(nodeIndex, t, 1) - 0.5) * span
+      const v = base + wave + noise
+      return node.dataType === 'Int32' ? Math.round(v) : Math.round(v * 100) / 100
+    }
+
+    const gapStart = now - 1000 * 90
+    const gapEnd = now - 1000 * 78
+
+    nodes.forEach((node, nodeIndex) => {
+      const points: SamplePoint[] = []
+      // 各测点自身的一小段坏数据窗口（与全局断开区间错开）
+      const ownBadStart = now - 1000 * (200 + nodeIndex * 15)
+      const ownBadEnd = ownBadStart + 1000 * (4 + (nodeIndex % 3))
+
+      for (let t = now - 1000 * 300; t <= now; t += 1000) {
+        const inGlobalGap = t >= gapStart && t <= gapEnd
+        const inOwnBad = t >= ownBadStart && t <= ownBadEnd
+        if (inGlobalGap || inOwnBad) {
+          points.push({ timestamp: t, value: null, quality: 'Bad' })
+        } else {
+          points.push({ timestamp: t, value: seedValue(node, nodeIndex, Math.floor(t / 1000)), quality: 'Good' })
+        }
+      }
+      dataHistory.value.set(node.id, points)
+    })
+
+    disconnectRanges.value = [{ start: gapStart, end: gapEnd }]
+  }
+
   // 选择节点
   function selectNode(node: OPCUANode) {
     selectedNode.value = node
@@ -267,11 +373,34 @@ export const useOpcuaStore = defineStore('opcua', () => {
   function connect() {
     isConnected.value = true
     initNodeTree()
+    seedHistory()
+    // 闭合可能存在的断开区间（由断开操作开启）
+    const now = Date.now()
+    disconnectRanges.value.forEach(r => {
+      if (r.end === null) r.end = now
+    })
+    pruneDisconnectRanges()
   }
 
   // 断开连接
   function disconnect() {
+    if (isConnected.value) {
+      // 开启一段断开区间，回看图表在该区间标注“无数据”
+      disconnectRanges.value.push({ start: Date.now(), end: null })
+    }
     isConnected.value = false
+    // 所有测点进入质量 Bad 状态，实时卡片质量码可见，但不产生新采样
+    getAllVariableNodes().forEach(node => {
+      node.quality = 'Bad'
+      const dv = realTimeData.value.get(node.id)
+      if (dv) dv.quality = 'Bad'
+    })
+  }
+
+  // 裁剪超出 1 小时保留窗口的断开区间
+  function pruneDisconnectRanges() {
+    const cutoff = Date.now() - HISTORY_RETENTION_MS
+    disconnectRanges.value = disconnectRanges.value.filter(r => (r.end ?? Date.now()) >= cutoff)
   }
 
   // 计算属性
@@ -287,6 +416,8 @@ export const useOpcuaStore = defineStore('opcua', () => {
     realTimeData,
     isConnected,
     dataHistory,
+    disconnectRanges,
+    playbackPickRequest,
     // 方法
     initNodeTree,
     simulateDataUpdate,
@@ -298,6 +429,9 @@ export const useOpcuaStore = defineStore('opcua', () => {
     connect,
     disconnect,
     getAllVariableNodes,
+    getNumericNodes,
+    getSamples,
+    requestPlaybackPick,
     // 计算属性
     activeAlarmsCount,
     criticalAlarmsCount

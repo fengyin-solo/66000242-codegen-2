@@ -46,11 +46,22 @@ export interface SubscriptionConfig {
   enabled: boolean
 }
 
-// 历史数据点
+// 历史数据点（采样读数）
+// value 为 null 表示该采样时刻数据源不可用（如断链/质量码 Bad），
+// 不能当作 0 画到曲线上，而应标注为“无数据”。
 export interface HistoryDataPoint {
   timestamp: number
-  value: number
+  value: number | null
   quality: 'Good' | 'Bad' | 'Uncertain'
+}
+
+// 回看分析使用的采样点，与历史数据点同构，保证图与明细读同一份采样
+export interface SamplePoint extends HistoryDataPoint {}
+
+// 数据源断开区间
+export interface DisconnectRange {
+  start: number
+  end: number | null
 }
 
 // 节点详情

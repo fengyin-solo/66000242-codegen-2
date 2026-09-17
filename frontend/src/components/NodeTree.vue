@@ -88,6 +88,14 @@
         >
           读取
         </el-button>
+        <el-button
+          v-if="store.selectedNode.type === 'Variable' && store.selectedNode.dataType !== 'Boolean'"
+          type="success"
+          size="small"
+          @click="handleAddToPlayback"
+        >
+          加入回看对比
+        </el-button>
       </div>
     </div>
   </div>
@@ -130,6 +138,12 @@ function handleSubscribe() {
 function handleReadValue() {
   if (!store.selectedNode) return
   ElMessage.success(`${store.selectedNode.name} = ${store.selectedNode.value} ${store.selectedNode.unit || ''}`)
+}
+
+function handleAddToPlayback() {
+  if (!store.selectedNode) return
+  store.requestPlaybackPick(store.selectedNode.id)
+  ElMessage.success(`已加入回看对比: ${store.selectedNode.name}`)
 }
 </script>
 

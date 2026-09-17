@@ -126,6 +126,9 @@
         </div>
       </div>
     </div>
+
+    <!-- 指标回看分析模块 -->
+    <PlaybackAnalysis />
   </div>
 </template>
 
@@ -138,6 +141,7 @@ import { LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, TitleComponent } from 'echarts/components'
 import { CircleCheckFilled, CircleCloseFilled } from '@element-plus/icons-vue'
 import { useOpcuaStore } from '../store/opcua'
+import PlaybackAnalysis from './PlaybackAnalysis.vue'
 
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, TitleComponent])
 
@@ -222,9 +226,9 @@ function getSpeedColor(val: number) {
   return '#34d399'
 }
 
-// 构建趋势图
+// 构建趋势图（固定曲线：沿用历史采样，仅过滤无数据点，不把断线画成 0）
 function buildChartOption(title: string, nodeId: string, color: string, unit: string) {
-  const history = store.dataHistory.get(nodeId) || []
+  const history = (store.dataHistory.get(nodeId) || []).filter(h => h.value !== null).slice(-100)
   const data = history.map(h => [h.timestamp, h.value])
 
   return {
